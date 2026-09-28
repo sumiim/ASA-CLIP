@@ -31,8 +31,7 @@ ASA-CLIP/
 │   ├── aggregate_seeds.py
 │   ├── check_val_split.py
 │   ├── measure_efficiency.py
-│   ├── bootstrap_eval.py
-│   └── queue/              # Optional multi-GPU job queue and configs
+│   └── bootstrap_eval.py
 ├── pretrained/             # Local checkpoint instructions only
 ├── requirements.txt
 ├── environment.yml
