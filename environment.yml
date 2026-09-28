@@ -1,0 +1,12 @@
+name: asa-clip
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -r requirements.txt
+# Install a CUDA PyTorch wheel that matches your driver before pip-installing
+# open_clip, e.g. torch 2.7.1 + cu118 as used in the revision runs.

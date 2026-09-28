@@ -1,0 +1,12 @@
+# Job ids. Worker pops the first non-comment line.
+# Example: three-seed main-table ASA-CLIP (lambda2=0.7, bottleneck=512).
+# Uncomment the lines you want to run.
+# sketchy_asl_s42
+# sketchy_asl_s43
+# sketchy_asl_s44
+# tuberlin_asl_s42
+# tuberlin_asl_s43
+# tuberlin_asl_s44
+# quickdraw_asl_s42
+# quickdraw_asl_s43
+# quickdraw_asl_s44

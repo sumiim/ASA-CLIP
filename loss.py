@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 
 class ContrastiveLoss(nn.Module):
+    """Bidirectional InfoNCE loss used for visual and semantic alignment."""
+
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature

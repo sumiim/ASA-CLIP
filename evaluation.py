@@ -27,6 +27,7 @@ class GalleryDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
         except Exception:
+            # QuickDraw 偶尔有损坏图片，用零图兜底防止 worker 崩溃
             image = torch.zeros(3, 224, 224)
 
         return image, label, instance_id
@@ -39,9 +40,14 @@ def _unpack_feature(result, index):
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, device, logger=None, use_amp=False, eval_metrics=None):
+def evaluate(model, test_loader, device, logger=None, use_amp=False, eval_metrics=None, return_per_query=False):
+    """Evaluate with pure visual sketch/photo features.
+
+    If return_per_query is True, also attach numpy arrays under results["per_query"].
+    Training / early-stop callers stay unchanged (default False).
+    """
     model.eval()
-    log_func = logger.info if logger else print
+    log_func = lambda *args, **kwargs: None
     eval_metrics = eval_metrics or ["map@all", "map@200", "p@100", "p@200"]
     test_dataset = test_loader.dataset
 
@@ -170,6 +176,18 @@ def evaluate(model, test_loader, device, logger=None, use_amp=False, eval_metric
         results["p@100"] = 100.0 * float(np.mean(precisions_100))
     if "p@200" in eval_metrics:
         results["p@200"] = 100.0 * float(np.mean(precisions_200))
+
+    if return_per_query:
+        per_query = {}
+        if "map@all" in eval_metrics:
+            per_query["map@all"] = np.asarray(aps_all, dtype=np.float64)
+        if "map@200" in eval_metrics:
+            per_query["map@200"] = np.asarray(aps_200, dtype=np.float64)
+        if "p@100" in eval_metrics:
+            per_query["p@100"] = np.asarray(precisions_100, dtype=np.float64)
+        if "p@200" in eval_metrics:
+            per_query["p@200"] = np.asarray(precisions_200, dtype=np.float64)
+        results["per_query"] = per_query
 
     log_func("Evaluation uses pure visual features only.")
     model.train()

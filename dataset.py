@@ -58,6 +58,31 @@ QUICKDRAW_CLASSES = {
     ],
 }
 
+# Held-out seen classes used only for model selection. Official unseen test is unchanged.
+VAL_CLASS_COUNTS = {
+    "sketchy": 10,
+    "tuberlin": 20,
+    "quickdraw": 8,
+}
+
+
+def holdout_val_classes(seen_classes, dataset_name, seed=DATASET_SPLIT_SEED):
+    """Split a fixed val set from already-determined seen classes.
+
+    The draw is independent of --seed so train/val/test Dataset instances match.
+    """
+    if dataset_name not in VAL_CLASS_COUNTS:
+        raise ValueError(f"No val-class count for dataset: {dataset_name}")
+    n_val = VAL_CLASS_COUNTS[dataset_name]
+    ordered = sorted(seen_classes)
+    if n_val >= len(ordered):
+        raise ValueError(
+            f"Cannot hold out {n_val} val classes from {len(ordered)} seen classes ({dataset_name})."
+        )
+    val = sorted(random.Random(seed).sample(ordered, n_val))
+    train = sorted(set(ordered) - set(val))
+    return train, val
+
 
 class BaseSketchPhotoDataset(Dataset):
     def __init__(self, transform=None, transform_sketch=None, transform_photo=None):
@@ -104,6 +129,8 @@ class BaseSketchPhotoDataset(Dataset):
 
 
 class QuickDrawDataset(BaseSketchPhotoDataset):
+    """QuickDraw-Ext and TU-Berlin-Ext category-level datasets."""
+
     def __init__(
         self,
         root_dir,
@@ -118,12 +145,16 @@ class QuickDrawDataset(BaseSketchPhotoDataset):
         **kwargs,
     ):
         super().__init__(transform, transform_sketch, transform_photo)
+        if mode not in {"train", "val", "test"}:
+            raise ValueError(f"Unsupported mode: {mode}. Expected train/val/test.")
         self.root_dir = root_dir
         self.mode = mode
         self.dataset_name = dataset_name
         self.gzs = gzs
         self.gzs_seen_ratio = gzs_seen_ratio
         self.log_func = logger.info if logger else print
+        self.seen_classes_pool = []
+        self.val_classes_pool = []
 
         if dataset_name == "quickdraw":
             self.sketch_dir = os.path.join(root_dir, "sketches")
@@ -181,21 +212,19 @@ class QuickDrawDataset(BaseSketchPhotoDataset):
         valid_classes = set(sketch_dirs).intersection(photo_dirs)
         photo_counts = {cls: len(self.image_files(photo_dirs[cls])) for cls in valid_classes}
 
-        self.train_classes_pool, self.test_classes_pool = self._split_classes(valid_classes, photo_counts)
-        all_classes = sorted(set(self.train_classes_pool).union(self.test_classes_pool))
+        seen_classes, self.test_classes_pool = self._split_classes(valid_classes, photo_counts)
+        self.seen_classes_pool = list(seen_classes)
+        self.train_classes_pool, self.val_classes_pool = holdout_val_classes(
+            self.seen_classes_pool, self.dataset_name
+        )
+        all_classes = sorted(set(self.seen_classes_pool).union(self.test_classes_pool))
         self.class_to_idx = {cls: idx for idx, cls in enumerate(all_classes)}
+        self.log_func(
+            f"Split classes: train={len(self.train_classes_pool)}, "
+            f"val={len(self.val_classes_pool)}, test={len(self.test_classes_pool)}"
+        )
 
-        if self.mode == "train":
-            query_classes = self.train_classes_pool
-            gallery_classes = self.train_classes_pool
-        else:
-            query_classes = self.test_classes_pool
-            if self.gzs:
-                num_seen = int(len(self.train_classes_pool) * self.gzs_seen_ratio)
-                seen = random.Random(DATASET_SPLIT_SEED).sample(self.train_classes_pool, num_seen)
-                gallery_classes = sorted(set(query_classes).union(seen))
-            else:
-                gallery_classes = query_classes
+        query_classes, gallery_classes = self._classes_for_mode()
 
         for cls in query_classes:
             self.sketch_paths.extend((path, cls) for path in self.image_files(sketch_dirs[cls]))
@@ -208,6 +237,20 @@ class QuickDrawDataset(BaseSketchPhotoDataset):
         self.log_func(
             f"Loaded queries={len(self.sketch_paths)}, gallery_classes={len(self.photo_paths_by_class)}"
         )
+
+    def _classes_for_mode(self):
+        if self.mode == "train":
+            return self.train_classes_pool, self.train_classes_pool
+        if self.mode == "val":
+            return self.val_classes_pool, self.val_classes_pool
+        query_classes = self.test_classes_pool
+        if self.gzs:
+            num_seen = int(len(self.seen_classes_pool) * self.gzs_seen_ratio)
+            seen = random.Random(DATASET_SPLIT_SEED).sample(self.seen_classes_pool, num_seen)
+            gallery_classes = sorted(set(query_classes).union(seen))
+        else:
+            gallery_classes = query_classes
+        return query_classes, gallery_classes
 
     def __len__(self):
         return len(self.sketch_paths)
@@ -224,6 +267,8 @@ class QuickDrawDataset(BaseSketchPhotoDataset):
 
 
 class SketchyDataset(BaseSketchPhotoDataset):
+    """Sketchy-Ext category-level dataset loader."""
+
     def __init__(
         self,
         root_dir,
@@ -238,9 +283,12 @@ class SketchyDataset(BaseSketchPhotoDataset):
         gzs_seen_ratio=0.2,
         **kwargs,
     ):
+        if mode not in {"train", "val", "test"}:
+            raise ValueError(f"Unsupported mode: {mode}. Expected train/val/test.")
         super().__init__(transform, transform_sketch, transform_photo)
         self.root_dir = root_dir
         self.mode = mode
+        self.dataset_name = "sketchy"
         self.split_mode = split_mode
         self.task_type = "category"
         self.gzs = gzs
@@ -256,10 +304,14 @@ class SketchyDataset(BaseSketchPhotoDataset):
         all_classes = sorted(
             d for d in os.listdir(self.sketch_root) if os.path.isdir(os.path.join(self.sketch_root, d))
         )
-        self.train_classes_pool, self.test_classes_pool = self._get_splits(all_classes)
-        self.class_to_idx = {
-            cls: idx for idx, cls in enumerate(sorted(self.train_classes_pool + self.test_classes_pool))
-        }
+        seen_classes, test_classes = self._get_splits(all_classes)
+        self.seen_classes_pool = list(seen_classes)
+        self.test_classes_pool = list(test_classes)
+        self.train_classes_pool, self.val_classes_pool = holdout_val_classes(
+            self.seen_classes_pool, "sketchy"
+        )
+        all_split_classes = sorted(set(self.seen_classes_pool).union(self.test_classes_pool))
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(all_split_classes)}
         self.sketch_paths = []
         self.photo_paths_by_class = {}
         self._load_data()
@@ -286,17 +338,26 @@ class SketchyDataset(BaseSketchPhotoDataset):
 
     def _load_data(self):
         self.log_func(f"Loading Sketchy ({self.mode})")
+        self.log_func(
+            f"Split classes: train={len(self.train_classes_pool)}, "
+            f"val={len(self.val_classes_pool)}, test={len(self.test_classes_pool)}"
+        )
         if self.mode == "train":
             query_classes = self.train_classes_pool
             gallery_classes = self.train_classes_pool
-        else:
+        elif self.mode == "val":
+            query_classes = self.val_classes_pool
+            gallery_classes = self.val_classes_pool
+        elif self.mode == "test":
             query_classes = self.test_classes_pool
             if self.gzs:
-                num_seen = int(len(self.train_classes_pool) * self.gzs_seen_ratio)
-                seen = random.Random(DATASET_SPLIT_SEED).sample(self.train_classes_pool, num_seen)
+                num_seen = int(len(self.seen_classes_pool) * self.gzs_seen_ratio)
+                seen = random.Random(DATASET_SPLIT_SEED).sample(self.seen_classes_pool, num_seen)
                 gallery_classes = sorted(set(self.test_classes_pool).union(seen))
             else:
                 gallery_classes = self.test_classes_pool
+        else:
+            raise ValueError(f"Unsupported mode: {self.mode}. Expected train/val/test.")
 
         for cls in sorted(set(query_classes).union(gallery_classes)):
             sketch_dir = os.path.join(self.sketch_root, cls)

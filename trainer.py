@@ -2,6 +2,8 @@ import csv
 import os
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from evaluation import evaluate
@@ -9,11 +11,18 @@ from loss import ContrastiveLoss
 
 
 class Trainer:
+    """Trainer for the paper model and its ablations.
+
+    Model selection uses an independent seen-class val loader. The official
+    unseen test loader is evaluated once at the end from the best val checkpoint.
+    """
+
     def __init__(
         self,
         model,
         optimizer,
         train_loader,
+        val_loader,
         test_loader,
         device,
         epochs,
@@ -32,6 +41,8 @@ class Trainer:
         sketch_text_target="adapted",
         photo_loss_target="none",
         scheduler=None,
+        eval_test_at_end=True,
+        summary=None,
     ):
         if not 0.0 <= lambda2 <= 1.0:
             raise ValueError("--lambda2 must be in [0, 1]. lambda1 is computed as 1 - lambda2.")
@@ -39,10 +50,13 @@ class Trainer:
             raise ValueError("sketch_text_target must be 'raw' or 'adapted'.")
         if photo_loss_target not in {"none", "raw", "adapted"}:
             raise ValueError("photo_loss_target must be 'none', 'raw', or 'adapted'.")
+        if val_loader is None:
+            raise ValueError("val_loader is required; do not use the test set for model selection.")
 
         self.model = model
         self.optimizer = optimizer
         self.train_loader = train_loader
+        self.val_loader = val_loader
         self.test_loader = test_loader
         self.device = device
         self.epochs = epochs
@@ -59,14 +73,26 @@ class Trainer:
         self.sketch_text_target = sketch_text_target
         self.photo_loss_target = photo_loss_target
         self.scheduler = scheduler
+        self.eval_test_at_end = eval_test_at_end
+        self.summary = summary
 
-        self.visual_loss_fn = ContrastiveLoss(temperature=temperature_v).to(self.device)
+        self.clipat_triplet = getattr(model, "sk_prompt", None) is not None
+        self.marl_method = hasattr(model, "marl_loss")
+        if self.clipat_triplet:
+            self.visual_loss_fn = nn.TripletMarginWithDistanceLoss(
+                distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y),
+                margin=0.2,
+            ).to(self.device)
+        else:
+            self.visual_loss_fn = ContrastiveLoss(temperature=temperature_v).to(self.device)
         self.semantic_loss_fn = ContrastiveLoss(temperature=temperature_sem).to(self.device)
 
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.device.type == "cuda")
         self.epochs_no_improve = 0
         self.best_metric = float("-inf")
         self.best_epoch_metrics = {}
+        self.best_epoch = 0
+        self.test_metrics = {}
 
         self.metrics_csv_path = os.path.join(self.run_dir, "evaluation_metrics.csv")
         self._initialize_csv()
@@ -85,9 +111,12 @@ class Trainer:
             "train_semantic_loss",
             "lambda2",
             "validation_metric_value",
+            "split",
         ]
         for metric in self.eval_metrics:
             self.csv_header.append(f"val_{metric}")
+        for metric in self.eval_metrics:
+            self.csv_header.append(f"test_{metric}")
         with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(self.csv_header)
 
@@ -128,11 +157,29 @@ class Trainer:
                         raise RuntimeError("Semantic alignment is enabled, but text_bank is None.")
                     target_text = self.text_bank[labels]
 
-                sketch_feat, photo_feat, adapted_text = self.model(
-                    sketches, photos, text_feat=target_text
-                )
+                if self.marl_method:
+                    if self.text_bank is None:
+                        raise RuntimeError("MARL requires text_bank.")
+                    target_text = self.text_bank[labels]
+                    visual_loss, _aux = self.model.marl_loss(
+                        sketches, photos, target_text, self.semantic_loss_fn
+                    )
+                    adapted_text = None
+                    sketch_feat = photo_feat = None
+                else:
+                    sketch_feat, photo_feat, adapted_text = self.model(
+                        sketches, photos, text_feat=target_text
+                    )
 
-                visual_loss = self.visual_loss_fn(sketch_feat, photo_feat)
+                if self.marl_method:
+                    pass
+                elif self.clipat_triplet:
+                    # CLIP-AT triplet: positive is the paired photo; negative is the
+                    # next in-batch photo (cyclic). Same paired sampling as our loader.
+                    neg_feat = torch.roll(photo_feat, shifts=1, dims=0)
+                    visual_loss = self.visual_loss_fn(sketch_feat, photo_feat, neg_feat)
+                else:
+                    visual_loss = self.visual_loss_fn(sketch_feat, photo_feat)
                 semantic_loss = torch.tensor(0.0, device=self.device)
                 active_lambda2 = 0.0
 
@@ -174,7 +221,24 @@ class Trainer:
             total_semantic_loss / num_batches,
         )
 
+    def checkpoint_path(self):
+        return os.path.join(self.run_dir, f"best_model_by_{self.validation_metric}.pth")
+
     def validate(self):
+        """Evaluate on the independent seen-class validation split only."""
+        self.model.eval()
+        metrics = evaluate(
+            self.model,
+            self.val_loader,
+            self.device,
+            self.logger,
+            use_amp=self.device.type == "cuda",
+            eval_metrics=self.eval_metrics,
+        )
+        return metrics.get(self.validation_metric, 0.0), metrics
+
+    def evaluate_test(self):
+        """Evaluate the official unseen test split once."""
         self.model.eval()
         metrics = evaluate(
             self.model,
@@ -184,10 +248,9 @@ class Trainer:
             use_amp=self.device.type == "cuda",
             eval_metrics=self.eval_metrics,
         )
-        return metrics.get(self.validation_metric, 0.0), metrics
+        return metrics
 
     def save_checkpoint(self, epoch, metric_value):
-        path = os.path.join(self.run_dir, f"best_model_by_{self.validation_metric}.pth")
         torch.save(
             {
                 "epoch": epoch,
@@ -195,14 +258,39 @@ class Trainer:
                 "metric": metric_value,
                 "lambda2": self.lambda2,
             },
-            path,
+            self.checkpoint_path(),
+        )
+
+    def load_best_checkpoint(self):
+        path = self.checkpoint_path()
+        if not os.path.exists(path):
+            self._log(f"No best checkpoint found at {path}; evaluating the current weights.")
+            return
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self._log(
+            f"Loaded best checkpoint from epoch {ckpt.get('epoch', '?')} "
+            f"(val {self.validation_metric}={ckpt.get('metric', float('nan')):.4f})."
         )
 
     def run(self):
-        mode_desc = "single-branch" if hasattr(self.model, "shared_model") else "dual-branch"
+        if getattr(self, "marl_method", False):
+            mode_desc = "marl, shared-ViT, LN+mode-embedding"
+        elif getattr(self, "clipat_triplet", False):
+            mode_desc = "clipat, shared-ViT, LN+visual-prompts, triplet"
+        elif hasattr(self.model, "shared_model"):
+            mode_desc = "single-branch"
+        else:
+            mode_desc = "dual-branch"
         if self.use_semantic_alignment:
             mode_desc += f", semantic={self.sketch_text_target}/{self.photo_loss_target}"
         self._log(f"Start training ({mode_desc}, lambda2={self.lambda2:.3f}).")
+        self._log(
+            "Model selection uses independent seen-class val; official test is evaluated once at the end."
+        )
+        if self.summary:
+            self.summary.write("[train]")
+            self.summary.kv(mode=mode_desc, lambda2=self.lambda2, max_epochs=self.epochs)
 
         for epoch in range(1, self.epochs + 1):
             train_loss, visual_loss, semantic_loss = self.train_one_epoch(epoch)
@@ -213,6 +301,7 @@ class Trainer:
                 "train_visual_loss": visual_loss,
                 "train_semantic_loss": semantic_loss,
                 "lambda2": self.lambda2,
+                "split": "val",
             }
 
             val_score, val_metrics = self.validate()
@@ -228,16 +317,26 @@ class Trainer:
                 f"Loss={train_loss:.4f}",
                 f"Visual={visual_loss:.4f}",
                 f"Semantic={semantic_loss:.4f}",
+                "val " + ", ".join(disp) if disp else "val (empty)",
             ]
-            if disp:
-                result_parts.append(", ".join(disp))
             self._log(" | ".join(result_parts))
 
             self._log_metrics_to_csv(metrics)
+            if self.summary:
+                improved = val_score > self.best_metric
+                self.summary.kv(
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    visual=visual_loss,
+                    semantic=semantic_loss,
+                    best=int(improved),
+                )
+                self.summary.metrics("val", val_metrics)
 
             if val_score > self.best_metric:
                 self.best_metric = val_score
                 self.best_epoch_metrics = val_metrics.copy()
+                self.best_epoch = epoch
                 self.epochs_no_improve = 0
                 self.save_checkpoint(epoch, val_score)
             else:
@@ -245,8 +344,38 @@ class Trainer:
 
             if self.epochs_no_improve >= self.patience:
                 self._log("Early stopping.")
+                if self.summary:
+                    self.summary.write(f"early_stop=1 epoch={epoch} patience={self.patience}")
                 break
 
         if self.best_epoch_metrics:
             details = [f"{k}={v:.2f}%" for k, v in self.best_epoch_metrics.items()]
-            self._log(f"Best {self.validation_metric}={self.best_metric:.4f} | {', '.join(details)}")
+            self._log(
+                f"Best val {self.validation_metric}={self.best_metric:.4f} "
+                f"(epoch {self.best_epoch}) | {', '.join(details)}"
+            )
+            if self.summary:
+                self.summary.write("[best_val]")
+                self.summary.kv(epoch=self.best_epoch, metric=self.validation_metric, value=self.best_metric)
+                self.summary.metrics("best_val", self.best_epoch_metrics)
+
+        if self.eval_test_at_end:
+            self.load_best_checkpoint()
+            self.test_metrics = self.evaluate_test()
+            test_disp = [f"{k}={v:.2f}%" for k, v in self.test_metrics.items()]
+            self._log("TEST (once, best val ckpt) | " + ", ".join(test_disp))
+            test_row = {
+                "epoch": self.best_epoch,
+                "lambda2": self.lambda2,
+                "split": "test",
+                "validation_metric_value": self.test_metrics.get(self.validation_metric, ""),
+            }
+            for key, value in self.best_epoch_metrics.items():
+                test_row[f"val_{key}"] = value
+            for key, value in self.test_metrics.items():
+                test_row[f"test_{key}"] = value
+            self._log_metrics_to_csv(test_row)
+            if self.summary:
+                self.summary.write("[test]")
+                self.summary.kv(epoch=self.best_epoch, ckpt=self.checkpoint_path())
+                self.summary.metrics("test", self.test_metrics)
